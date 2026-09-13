@@ -27,28 +27,31 @@ class SamplingParams:
 
 @dataclass(eq=False)
 class Req:
-    """后端（调度器侧）的请求对象：由 PendingReq 构造，随一轮接一轮的 prefill / decode 推进，直到结束或被 abort。
+    """后端（调度器侧）的请求对象：由 PendingReq 构造，随一轮接一轮的 prefill / decode 推进，
+    直到请求结束或被 abort。
 
     序列长度由三个数字描述，恒满足 cached_len <= device_len <= max_device_len：
 
-        [0, cached_len)               前缀部分，KV 已经算好并留在 cache 里，attention 直接读，无需重算
+        [0, cached_len)               前缀：KV 已算好并留在 cache 中，attention 直接读
         [cached_len, device_len)      本次 forward 要计算的部分，长度即 extend_len
-        [device_len, max_device_len)  本次之后还未上 device 的部分
+        [device_len, max_device_len)  本次之后还没上 device 的部分
 
-    每做完一次 forward，complete_one() 把 cached_len 追平到 device_len，再把 device_len +1（腾出
-    一个位置放刚采样出的 token），如此循环往复。
+    每做完一次 forward，complete_one() 会把 cached_len 追平到 device_len，再把 device_len
+    +1（腾出一个位置放刚采样出的 token），如此循环往复。
 
-    eq=False 表示按对象身份比较和哈希，因此 Req 可以直接放进 Set（例如 DecodeManager.running_reqs）。
-    prefill 被切块时构造的是子类 ChunkedReq（见 scheduler/prefill.py），它不参与采样。
+    eq=False 表示按对象身份比较和哈希，因此 Req 可以直接放进 Set
+    （例如 DecodeManager.running_reqs）；prefill 被切块时构造的是子类 ChunkedReq
+    （见 scheduler/prefill.py），它不参与采样。
     """
 
-    input_ids: torch.Tensor  # CPU tensor：host 侧的 token 序列（prompt + 已采出的 token），由 append_host() 追加
-    table_idx: int  # 本请求在全局 page_table / token_pool 中的行号（slot），由 TableManager 分配与回收
+    # input_ids 是 host 侧的副本：prompt + 已采出的 token，由 append_host() 逐个追加
+    input_ids: torch.Tensor  # cpu tensor
+    table_idx: int  # page_table / token_pool 的行号，由 TableManager 分配与回收
     cached_len: int  # 已算好 KV 的前缀长度，本次 forward 只需要算它之后的部分
     output_len: int  # 最多还能生成多少 token（取自 sampling_params.max_tokens）
     uid: int  # 全局唯一的请求 id，用于结果回传和 abort 匹配
-    sampling_params: SamplingParams  # 该请求的采样配置（temperature / top_k / top_p / max_tokens ...）
-    cache_handle: BaseCacheHandle  # 前缀缓存句柄：锁住已命中的前缀，并记录插入到缓存前已有的长度
+    sampling_params: SamplingParams  # 该请求的采样配置（temperature、top_k、top_p 等）
+    cache_handle: BaseCacheHandle  # 前缀缓存句柄：锁住已命中的前缀，记录插入缓存前已有的长度
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -111,19 +114,21 @@ class Batch:
         input_ids         Scheduler._forward()：每个 token 的 id，直接喂给 embedding
         attn_metadata     attention backend 的 prepare_metadata() / prepare_for_replay()
 
-    input_ids / positions / out_loc 三者形状相同：把所有 padded_reqs 的 [cached_len, device_len) 区间
-    按顺序拼成的一条扁平数组（长度 = 各 req 的 extend_len 之和）。
+    input_ids / positions / out_loc 三者形状相同：把所有 padded_reqs 的
+    [cached_len, device_len) 区间按顺序拼成一条扁平数组，长度 = 各 req 的 extend_len 之和。
     """
 
     reqs: List[Req]  # 本批次真正要处理的请求；decode 时按 uid 排序，保证各 TP rank 的请求顺序一致
     phase: Literal["prefill", "decode"]  # 本批次属于哪个阶段，决定 q/k 的长度取法
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)  # 本批次所有待计算 token 的 id
-    positions: torch.Tensor = field(init=False)  # 与之对应的位置下标（prefill 时从 cached_len 开始，不一定从 0 开始）
+    # positions 是每个 token 的绝对位置；prefill 命中前缀缓存时从 cached_len 起算
+    positions: torch.Tensor = field(init=False)
     out_loc: torch.Tensor = field(init=False)  # 与之对应的 cache 物理槽位，store_kv 按它写入 K/V
-    padded_reqs: List[Req] = field(init=False)  # reqs + 若干 dummy_req，用于对齐到 CUDA graph 的 batch size
+    # reqs + 若干 dummy_req：CUDA graph 要求固定的 batch size，不足的用 dummy 补齐
+    padded_reqs: List[Req] = field(init=False)
     # this field should be set by attention backend
-    attn_metadata: BaseAttnMetadata = field(init=False)  # 后端自定义的元数据（cu_seqlens、page_table 等）
+    attn_metadata: BaseAttnMetadata = field(init=False)  # 后端自定义的元数据（cu_seqlens 等）
 
     @property
     def is_prefill(self) -> bool:
@@ -148,11 +153,12 @@ class Batch:
 class Context:
     """每个进程（也就是每个 TP rank）一份的运行时上下文，由 Engine 构造后注册为全局单例。
 
-    为什么要做成全局的：模型各层（attention / moe / lm_head）的 forward 只接收张量参数，不接收 batch，
-    但每一层又都要用到"当前这一批请求"和 KV cache。与其把 batch 一路透传穿过整个 module 树，
-    不如挂在全局上下文里，层内用 get_global_ctx() 取用（见 layers/attention.py、layers/moe.py）。
-    CUDA graph 抓取时这一点尤其关键：GraphRunner 用 forward_batch() 把 dummy batch 挂上去，
-    再调用同样签名的 model.forward() 即可完成抓图。
+    为什么要做成全局的：模型各层（attention / moe / lm_head）的 forward 只接收张量参数，
+    不接收 batch，但每层又都要用到"当前这一批请求"和 KV cache。与其把 batch 一路透传
+    穿过整个 module 树，不如挂在全局上下文里，层内用 get_global_ctx() 取用
+    （见 layers/attention.py、layers/moe.py）。CUDA graph 抓取时这一点尤其关键：
+    GraphRunner 用 forward_batch() 把 dummy batch 挂上去，再调用同样签名的
+    model.forward() 即可完成抓图。
 
     字段是分步填的：Engine.__init__ 里先 Context(page_size)，再依次补上 kv_cache、page_table、
     attn_backend、moe_backend。
@@ -160,14 +166,15 @@ class Context:
 
     page_size: int  # KV cache 的页大小；大于 1 时相邻的若干 token 共用一个物理页
     # NOTE: this table always treat page_size = 1
-    page_table: torch.Tensor = field(init=False)  # [max_running_req + 1, aligned_max_seq_len] 的 int32：
-    # 行 = 请求的 table_idx（最后一行留给 dummy_req），列 = 请求内的 token 位置，
-    # 值 = 该 token 的 K/V 在 kv_cache 里的物理槽位。注意这里始终按 page_size = 1 逐 token 记录，
-    # 页的折叠由 attention 后端按 page_size 步长切片完成。
-    attn_backend: BaseAttnBackend = field(init=False)  # attention 后端：拼元数据、选 kernel、负责抓/放 CUDA graph
+    # [max_running_req + 1, aligned_max_seq_len] 的 int32：行 = 请求的 table_idx
+    # （最后一行留给 dummy_req），列 = 请求内的 token 位置，值 = 该 token 的 K/V 在
+    # kv_cache 里的物理槽位。始终按 page_size = 1 逐 token 记录，页的折叠由 attention
+    # 后端按 page_size 步长切片完成。
+    page_table: torch.Tensor = field(init=False)
+    attn_backend: BaseAttnBackend = field(init=False)  # attention 后端：拼元数据、选 kernel 等
     moe_backend: BaseMoeBackend = field(init=False)  # MoE 后端；非 MoE 模型不会设置这个字段
     kv_cache: BaseKVCachePool = field(init=False)  # K/V 的物理存储池，按 page_table 里的槽位寻址
-    _batch: Batch | None = field(default=None, init=False)  # 当前正在 forward 的 batch，仅 forward_batch() 期间非空
+    _batch: Batch | None = field(default=None, init=False)  # 只在 forward_batch() 中非空
 
     @property
     def batch(self) -> Batch:
@@ -196,7 +203,8 @@ _GLOBAL_CTX: Context | None = None
 def set_global_ctx(ctx: Context):
     """注册全局上下文；断言只能设置一次，因此一个进程里只能有一个 Engine。
 
-    测试里请用 fixture 提前把 _GLOBAL_CTX 置空并在结束后还原（见 tests/core/test_cache_allocate.py）。
+    测试里请用 fixture 提前把 _GLOBAL_CTX 置空，结束后再还原
+    （见 tests/core/test_cache_allocate.py）。
     """
     global _GLOBAL_CTX
     assert _GLOBAL_CTX is None, "Global context is already set"
